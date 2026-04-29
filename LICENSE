@@ -1,0 +1,35 @@
+WARM AI TRACKER — SOURCE-VISIBLE LICENSE
+Copyright (c) 2026 Warm AI Ltd, United Kingdom. All rights reserved.
+
+You are granted permission to:
+
+  1. Read and inspect the source code in this repository for the
+     purposes of security audit, privacy review, regulatory
+     diligence, and academic reference.
+
+  2. Quote portions of this source code in security disclosures,
+     audit reports, regulatory filings, journalism, and academic
+     work, with attribution.
+
+You are NOT granted permission to:
+
+  1. Redistribute this source code, modified or unmodified, except
+     as required to load the script from `https://assets.warmai.uk/`
+     on websites operated by Warm AI Ltd's customers under contract.
+
+  2. Self-host, mirror, or republish this script on any domain
+     other than `assets.warmai.uk` and its successors operated by
+     Warm AI Ltd.
+
+  3. Modify and deploy a derivative version under the Warm AI
+     brand or in a way that could be confused with the original.
+
+  4. Use this source as a basis for a competing product without a
+     separate written license from Warm AI Ltd.
+
+For any other use, contact support@getwarmai.com.
+
+THIS SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND
+NONINFRINGEMENT.
