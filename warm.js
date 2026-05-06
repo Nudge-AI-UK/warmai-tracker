@@ -4,8 +4,8 @@
  *
  * @product       WarmAI Visitor Identification
  * @vendor        Warm AI Ltd, United Kingdom
- * @version       safe-2.0.0
- * @released      2026-04-28
+ * @version       safe-2.1.0
+ * @released      2026-05-06
  * @security      https://assets.warmai.uk/.well-known/security.txt
  * @source        https://github.com/Nudge-AI-UK/warmai-tracker
  * @docs          https://getwarmai.com/tracker
@@ -18,8 +18,20 @@
  * (cleared when the tab closes; treated as "necessary" by every
  * cookie consent law we know of).
  *
- * Honours Do Not Track (DNT) and Global Privacy Control (GPC) — if
- * either is set, the script returns immediately and fires no beacons.
+ * Consent handling:
+ *   - Honours Do Not Track (DNT) and Global Privacy Control (GPC) —
+ *     if either is set, the script returns immediately and fires no
+ *     beacons.
+ *   - Auto-detects standard CMPs (Cookiebot, OneTrust, Transcend) and
+ *     Google Consent Mode v2 / GTM. When a CMP is present, defers
+ *     firing until analytics_storage / Statistics consent is granted;
+ *     queues up to 50 events meanwhile.
+ *   - When no CMP is detected, fires immediately (default behaviour
+ *     for sites that don't run a consent platform — matches Snitcher
+ *     Radar, Leadfeeder Tracker, and other B2B identification pixels).
+ *   - Manual override on install tag: <script ... data-consent="granted">
+ *     or "denied". Runtime control: window.warmai('consent','grant'|
+ *     'revoke'|'status') or window.warmai.giveCookieConsent().
  *
  * What it captures per session:
  *   - session_token (sessionStorage, 30-min idle TTL)
@@ -33,8 +45,6 @@
  *   - No form-input scraping (no captured_email, no form_events)
  *   - No fingerprinting (no canvas, no webGL, no font enumeration, no audio)
  *   - No third-party network calls (only beacon to track.getwarmai.com, our own infra)
- *   - No consent gate needed — nothing here triggers consent requirements
- *     in any major jurisdiction
  *
  * Customers wanting cross-session visitor identification, form analytics,
  * or returning-visitor counts: use warm-pro.js (requires a CMP or
@@ -47,7 +57,7 @@
  *   - Behaviour can be audited by reading this file in full — under 8KB,
  *     no obfuscation, no minification of meaningful logic.
  */
-/* WARMAI_VERSION=safe-2.0.0 RELEASED=2026-04-28 */
+/* WARMAI_VERSION=safe-2.1.0 RELEASED=2026-05-06 */
 (function(){'use strict';
 
 // Hard-skip if visitor has signalled Do Not Track or Global Privacy Control.
@@ -56,6 +66,191 @@ if (navigator.doNotTrack === '1' ||
     navigator.doNotTrack === 'yes' ||
     window.doNotTrack === '1' ||
     navigator.globalPrivacyControl === true) return;
+
+/* ─── Consent management ───────────────────────────────────────────────
+ * Detects standard Consent Management Platforms (CMPs) on the host
+ * page and defers firing until analytics consent is granted. When no
+ * CMP is present, falls through to default behaviour (fire freely) so
+ * sites without a consent platform aren't broken.
+ *
+ * Supported CMPs (matches Snitcher Radar's adapter set + GTM):
+ *   - Cookiebot         (window.Cookiebot.consent.statistics)
+ *   - OneTrust          (OptanonConsent cookie, group C0002)
+ *   - Transcend         (window.airgap.getConsent().purposes.Analytics)
+ *   - Google Consent Mode v2 / GTM
+ *                       (window.dataLayer ['consent','update',{...}])
+ *
+ * State machine:
+ *   'granted'  → fire normally
+ *   'pending'  → CMP detected, no decision yet → queue events (cap 50),
+ *                replay on grant
+ *   'denied'   → drop events silently
+ *   'unknown'  → no CMP detected → fire normally (backwards compat)
+ *
+ * Public API:
+ *   window.warmai('consent', 'grant')   — manual grant (overrides CMP)
+ *   window.warmai('consent', 'revoke')  — manual revoke
+ *   window.warmai('consent', 'status')  — { state, source, queued }
+ *   window.warmai.giveCookieConsent()   — alias for 'grant' (Snitcher-compat)
+ *   window.warmai.revokeCookieConsent() — alias for 'revoke'
+ *   <script ... data-consent="granted|denied">  — install-tag override
+ */
+var consentState='unknown',consentSource='none',consentQueue=[],CONSENT_QUEUE_CAP=50;
+var activeAdapter=null;
+
+var CMP_ADAPTERS=[
+  {
+    name:'cookiebot',
+    detect:function(){return !!(window.Cookiebot&&window.Cookiebot.consent)},
+    read:function(){
+      var c=window.Cookiebot.consent;
+      if(typeof c.statistics!=='boolean')return 'pending';
+      return c.statistics?'granted':'denied'
+    },
+    listen:function(cb){
+      window.addEventListener('CookiebotOnAccept',cb,false);
+      window.addEventListener('CookiebotOnDecline',cb,false);
+      window.addEventListener('CookiebotOnLoad',cb,false)
+    }
+  },
+  {
+    name:'onetrust',
+    detect:function(){return !!window.OneTrust||/OptanonConsent=/.test(document.cookie)},
+    read:function(){
+      var m=document.cookie.match(/OptanonConsent=([^;]+)/);
+      if(!m)return 'pending';
+      var raw=decodeURIComponent(m[1]);
+      var g=raw.match(/groups=([^&]+)/);
+      if(!g)return 'pending';
+      // C0002 = Performance/Analytics in OneTrust's standard taxonomy
+      return /C0002:1/.test(g[1])?'granted':'denied'
+    },
+    listen:function(cb){
+      window.addEventListener('OneTrustGroupsUpdated',cb,false);
+      window.addEventListener('consent.onetrust',cb,false)
+    }
+  },
+  {
+    name:'transcend',
+    detect:function(){return !!(window.airgap&&typeof window.airgap.getConsent==='function')},
+    read:function(){
+      try{
+        var c=window.airgap.getConsent();
+        if(!c||!c.purposes)return 'pending';
+        return c.purposes.Analytics?'granted':'denied'
+      }catch(e){return 'pending'}
+    },
+    listen:function(cb){
+      try{
+        if(window.airgap.addEventListener){
+          window.airgap.addEventListener('consent-resolved',cb);
+          window.airgap.addEventListener('consent-changed',cb)
+        }
+      }catch(e){}
+    }
+  },
+  {
+    name:'gtm',
+    detect:function(){
+      // Only count GTM/Consent Mode if a consent default/update has actually
+      // been pushed to dataLayer. Bare dataLayer presence (every GA4 install)
+      // shouldn't trip us into 'pending'.
+      if(!Array.isArray(window.dataLayer))return false;
+      for(var i=0;i<window.dataLayer.length;i++){
+        var e=window.dataLayer[i];
+        if(e&&(e[0]==='consent'||e.event==='consent_default'||e.event==='consent_update'))return true
+      }
+      return false
+    },
+    read:function(){
+      var dl=window.dataLayer;
+      for(var i=dl.length-1;i>=0;i--){
+        var e=dl[i];
+        if(e&&e[0]==='consent'&&(e[1]==='update'||e[1]==='default')&&e[2]){
+          var v=e[2].analytics_storage;
+          if(v==='granted')return 'granted';
+          if(v==='denied')return 'denied'
+        }
+      }
+      return 'pending'
+    },
+    listen:function(cb){
+      try{
+        var origPush=window.dataLayer.push;
+        window.dataLayer.push=function(){
+          var ret=origPush.apply(this,arguments);
+          try{
+            for(var i=0;i<arguments.length;i++){
+              var a=arguments[i];
+              if(a&&a[0]==='consent'&&(a[1]==='update'||a[1]==='default')){cb();break}
+            }
+          }catch(e){}
+          return ret
+        }
+      }catch(e){}
+    }
+  }
+];
+
+function detectAdapter(){
+  for(var i=0;i<CMP_ADAPTERS.length;i++){
+    if(CMP_ADAPTERS[i].detect())return CMP_ADAPTERS[i]
+  }
+  return null
+}
+
+function readConsentAttr(){
+  try{
+    var s=document.currentScript;
+    if(s){
+      var v=s.getAttribute('data-consent');
+      if(v==='granted'||v==='denied')return v
+    }
+  }catch(e){}
+  return null
+}
+
+function evaluateConsent(){
+  var attr=readConsentAttr();
+  if(attr==='granted'){consentState='granted';consentSource='attr';return}
+  if(attr==='denied'){consentState='denied';consentSource='attr';return}
+  if(activeAdapter){
+    consentState=activeAdapter.read();
+    consentSource=activeAdapter.name;
+    return
+  }
+  consentState='unknown';consentSource='none'
+}
+
+function flushConsentQueue(){
+  var q=consentQueue.slice();
+  consentQueue=[];
+  for(var i=0;i<q.length;i++)trk(q[i].ev,q[i].ex)
+}
+
+function onConsentChange(){
+  var prev=consentState;
+  evaluateConsent();
+  if(prev!==consentState&&consentState==='granted')flushConsentQueue()
+}
+
+function consentInit(){
+  activeAdapter=detectAdapter();
+  if(activeAdapter)activeAdapter.listen(onConsentChange);
+  evaluateConsent()
+}
+
+function consentApi(cmd){
+  if(cmd==='grant'){
+    var prev=consentState;
+    consentState='granted';consentSource='manual';
+    if(prev!=='granted')flushConsentQueue()
+  }else if(cmd==='revoke'){
+    consentState='denied';consentSource='manual';consentQueue=[]
+  }else if(cmd==='status'){
+    return{state:consentState,source:consentSource,queued:consentQueue.length}
+  }
+}
 
 var PROXY_URL='https://track.getwarmai.com/api/track';
 var FALLBACK_URL='https://muagykdazutcjpapkcer.supabase.co/functions/v1/tracking-event';
@@ -138,6 +333,13 @@ function tsc(){var d=gsd();if(d>msd)msd=d;upd()}
 function gpd(){return st?Math.round((Date.now()-st)/1000):0}
 
 function trk(ev,ex){
+  // Consent gate. 'granted' / 'unknown' fire normally; 'pending' queues
+  // (replayed on grant); 'denied' drops silently.
+  if(consentState==='denied')return;
+  if(consentState==='pending'){
+    if(consentQueue.length<CONSENT_QUEUE_CAP)consentQueue.push({ev:ev,ex:ex});
+    return
+  }
   var d={
     tracking_script_id:id,
     event_type:ev,
@@ -215,6 +417,7 @@ function nav(){
 }
 
 function init(){
+  consentInit();
   start();
   var sdt;
   window.addEventListener('scroll',function(){clearTimeout(sdt);sdt=setTimeout(tsc,100)},{passive:true});
@@ -251,12 +454,20 @@ function init(){
 
   window.WarmAI=window.WarmAI||{};
   window.WarmAI.track=function(n,d){trk('page_view',Object.assign({custom_event:n},d))};
+  window.WarmAI.giveCookieConsent=function(){consentApi('grant')};
+  window.WarmAI.revokeCookieConsent=function(){consentApi('revoke')};
+  window.WarmAI.consentStatus=function(){return consentApi('status')};
 
-  // GTM-style dispatcher
+  // GTM-style dispatcher — handles 'track' and 'consent' commands.
   window.warmai=function(cmd){
     var args=Array.prototype.slice.call(arguments,1);
     if(cmd==='track'){trk('page_view',Object.assign({custom_event:args[0]},args[1]||{}))}
+    else if(cmd==='consent'){return consentApi(args[0])}
   };
+  // Snitcher-compat aliases — visible to static analyzers / Google Ads
+  // policy crawlers as a public consent contract.
+  window.warmai.giveCookieConsent=function(){consentApi('grant')};
+  window.warmai.revokeCookieConsent=function(){consentApi('revoke')};
   for(var di=0;di<qCalls.length;di++){var dc=qCalls[di];if(dc&&dc[0]!=='init'){window.warmai.apply(null,dc)}}
 }
 
